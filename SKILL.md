@@ -28,7 +28,7 @@ uv run python -m vllm.entrypoints.openai.api_server \
   --gpu-memory-utilization 0.95 \
   --enable-chunked-prefill \
   --no-enable-prefix-caching \
-  --max-num-seqs 256 \
+  --max-num-seqs <max_concurrency> \
   --max-model-len 65536 \
   --port 8000 \
   --host 0.0.0.0
@@ -45,7 +45,7 @@ VLLM_HOST_IP=<ray_head_ip> uv run python -m vllm.entrypoints.openai.api_server \
   --gpu-memory-utilization 0.95 \
   --enable-chunked-prefill \
   --no-enable-prefix-caching \
-  --max-num-seqs 256 \
+  --max-num-seqs <max_concurrency> \
   --max-model-len 65536 \
   --port 8000 \
   --host 0.0.0.0
@@ -55,6 +55,7 @@ Key notes:
 - **Multi-node only**: `VLLM_HOST_IP` must be set to the Ray head node's internal/cluster IP. Find it with `ray status` or `hostname -I`.
 - `--no-enable-prefix-caching` — must be disabled for benchmarking since all requests use the same prompt, which would inflate prefill numbers ~40x if cached.
 - `--enable-chunked-prefill` — allows interleaving prefill and decode for better throughput.
+- `--max-num-seqs` — must be >= the highest concurrency level being benchmarked, otherwise the server caps the batch size and queues the rest, bottlenecking the results.
 - Wait for the server to be healthy before benchmarking: `curl http://localhost:8000/health`
 - Read the `KV cache size: X tokens` line from server logs — you need this for `--kv-cache-tokens`.
 
