@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -11,9 +12,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+def safe_model_name(model: str) -> str:
+    return model.split("/")[-1]
+
+
 async def make_prompt(base_url: str, model: str, target_tokens: int) -> tuple[str, int]:
     """Generate a prompt calibrated to approximately target_tokens input tokens."""
-    # Start conservatively: each "hi " is ~1-2 tokens for most tokenizers
     words = ["hi"] * target_tokens
     prompt = " ".join(words)
     url = f"{base_url}/v1/chat/completions"
@@ -24,7 +28,6 @@ async def make_prompt(base_url: str, model: str, target_tokens: int) -> tuple[st
             assert resp.status == 200, f"Calibration failed: {resp.status} {await resp.text()}"
             actual = (await resp.json())["usage"]["prompt_tokens"]
 
-        # Adjust proportionally if off by more than 5%
         if abs(actual - target_tokens) / target_tokens > 0.05:
             adjusted = int(len(words) * target_tokens / actual)
             words = ["hi"] * max(1, adjusted)
@@ -103,7 +106,6 @@ async def run_bench(
         await asyncio.gather(*tasks, return_exceptions=True)
 
     out_tps = stats["output_tokens"] / elapsed
-    # Estimate total throughput assuming steady-state amortized prefill
     total_tps = out_tps * (actual_input_tokens + output_len) / output_len
 
     print(f" {out_tps:.0f} out tok/s, {total_tps:.0f} total tok/s", flush=True)
@@ -121,71 +123,22 @@ async def run_bench(
     }
 
 
-def plot_results(results: list[dict], output_dir: Path, fixed_output_len: int | None = None):
-    fig, ax = plt.subplots(figsize=(12, 7))
-    colors = plt.cm.tab10.colors
-
-    if fixed_output_len is not None:
-        # Single series: all points have the same fixed output len
-        subset = sorted(results, key=lambda r: r["concurrency"])
-        xs = [r["concurrency"] for r in subset]
-        total_ys = [r["total_throughput"] for r in subset]
-        ax.plot(xs, total_ys, "o-", color=colors[0], label=f"prefill tok/s (output_len={fixed_output_len})")
+async def run_sweep(base_url, model, kv_cache_tokens, max_model_len, concurrency_levels, warmup, duration, output_len_override=None, ratios=None):
+    """Run a sweep and return list of result dicts."""
+    if output_len_override is not None:
+        sweep_ratios = [None]
     else:
-        ratios = sorted(set(r["ratio"] for r in results))
-        for i, ratio in enumerate(ratios):
-            subset = sorted([r for r in results if r["ratio"] == ratio], key=lambda r: r["concurrency"])
-            xs = [r["concurrency"] for r in subset]
-            out_ys = [r["output_throughput"] for r in subset]
-            total_ys = [r["total_throughput"] for r in subset]
-
-            label = f"{int(ratio*100)}% in / {int((1-ratio)*100)}% out"
-            ax.plot(xs, out_ys, "o-", color=colors[i], label=f"{label} - output tok/s")
-            ax.plot(xs, total_ys, "s--", color=colors[i], alpha=0.6, label=f"{label} - total tok/s")
-
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("Max Concurrency")
-    ax.set_ylabel("Throughput (tokens/s)")
-    ax.set_title("vLLM Throughput Sweep")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    out_path = output_dir / "throughput_sweep.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"\nGraph saved to {out_path}")
-
-
-def print_summary(results: list[dict]):
-    print(f"\n{'='*90}")
-    print(f"{'Ratio':>6} {'Conc':>6} {'SeqLen':>8} {'In':>6} {'Out':>6} {'Out tok/s':>12} {'Total tok/s':>12} {'Errors':>8}")
-    print(f"{'-'*90}")
-    for r in sorted(results, key=lambda x: (x["ratio"], x["concurrency"])):
-        print(
-            f"{r['ratio']:>6.2f} {r['concurrency']:>6} {r['input_len']+r['output_len']:>8} "
-            f"{r['input_len']:>6} {r['output_len']:>6} {r['output_throughput']:>12.1f} {r['total_throughput']:>12.1f} {r['errors']:>8}"
-        )
-    print(f"{'='*90}")
-
-
-async def async_main(args):
-    if args.fixed_output_len is not None:
-        ratios = [None]
-    else:
-        ratios = [float(r) for r in args.ratios.split(",")]
-    concurrency_levels = [int(c) for c in args.concurrency_levels.split(",")]
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+        sweep_ratios = ratios
 
     results = []
     prompt_cache = {}
 
-    for ratio in ratios:
+    for ratio in sweep_ratios:
         for concurrency in concurrency_levels:
-            seq_len = min(args.kv_cache_tokens // concurrency, args.max_model_len - 256)
+            seq_len = min(kv_cache_tokens // concurrency, max_model_len - 256)
 
-            if args.fixed_output_len is not None:
-                output_len = args.fixed_output_len
+            if output_len_override is not None:
+                output_len = output_len_override
                 input_len = seq_len - output_len
                 ratio_val = input_len / seq_len
             else:
@@ -194,7 +147,7 @@ async def async_main(args):
                 ratio_val = ratio
 
             if input_len < 1 or output_len < 1 or seq_len < 4:
-                print(f"\nSkipping concurrency={concurrency}: seq_len={seq_len} too small")
+                print(f"\nSkipping concurrency={concurrency}: seq too small")
                 continue
 
             print(f"\n{'='*60}")
@@ -202,52 +155,221 @@ async def async_main(args):
             print(f"{'='*60}")
 
             if input_len not in prompt_cache:
-                prompt, actual = await make_prompt(args.base_url, args.model, input_len)
+                prompt, actual = await make_prompt(base_url, model, input_len)
                 prompt_cache[input_len] = (prompt, actual)
                 print(f"  Calibrated prompt: target={input_len}, actual={actual} tokens")
 
             prompt, actual_input = prompt_cache[input_len]
 
             data = await run_bench(
-                base_url=args.base_url,
-                model=args.model,
+                base_url=base_url,
+                model=model,
                 prompt=prompt,
                 actual_input_tokens=actual_input,
                 output_len=output_len,
                 concurrency=concurrency,
-                warmup_s=args.warmup,
-                measure_s=args.duration,
+                warmup_s=warmup,
+                measure_s=duration,
             )
 
             results.append({
-                "ratio": ratio_val,
+                "ratio": round(ratio_val, 4),
                 "concurrency": concurrency,
                 "input_len": input_len,
                 "output_len": output_len,
                 **data,
             })
 
-    if not results:
+    return results
+
+
+def plot_prefill(results: list[dict], output_path: Path, model: str):
+    fig, ax = plt.subplots(figsize=(12, 7))
+    subset = sorted(results, key=lambda r: r["concurrency"])
+    xs = [r["concurrency"] for r in subset]
+    ys = [r["total_throughput"] for r in subset]
+    ax.plot(xs, ys, "o-", color=plt.cm.tab10.colors[0], label="prefill tok/s")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Max Concurrency")
+    ax.set_ylabel("Throughput (tokens/s)")
+    ax.set_title(f"Prefill Throughput — {model}")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_decode(results: list[dict], output_path: Path, model: str):
+    fig, ax = plt.subplots(figsize=(12, 7))
+    colors = plt.cm.tab10.colors
+    ratios = sorted(set(r["ratio"] for r in results))
+
+    for i, ratio in enumerate(ratios):
+        subset = sorted([r for r in results if r["ratio"] == ratio], key=lambda r: r["concurrency"])
+        xs = [r["concurrency"] for r in subset]
+        out_ys = [r["output_throughput"] for r in subset]
+        total_ys = [r["total_throughput"] for r in subset]
+        label = f"{int(ratio*100)}% in / {int((1-ratio)*100)}% out"
+        ax.plot(xs, out_ys, "o-", color=colors[i], label=f"{label} — output tok/s")
+        ax.plot(xs, total_ys, "s--", color=colors[i], alpha=0.6, label=f"{label} — total tok/s")
+
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Max Concurrency")
+    ax.set_ylabel("Throughput (tokens/s)")
+    ax.set_title(f"Decode Throughput — {model}")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_markdown(
+    path: Path,
+    args,
+    prefill_results: list[dict],
+    decode_results: list[dict],
+    prefill_plot: str,
+    decode_plot: str,
+):
+    model_name = safe_model_name(args.model)
+    lines = [
+        f"# Benchmark: {args.model}",
+        "",
+        "## Server Configuration",
+        "",
+        f"| Parameter | Value |",
+        f"|-----------|-------|",
+        f"| Model | {args.model} |",
+        f"| TP | {args.tp} |",
+        f"| Max Model Len | {args.max_model_len:,} |",
+        f"| KV Cache Tokens | {args.kv_cache_tokens:,} |",
+        f"| KV Cache Dtype | {args.kv_cache_dtype} |",
+        f"| Prefix Caching | disabled |",
+        f"| Chunked Prefill | enabled |",
+        f"| Warmup | {args.warmup}s |",
+        f"| Measurement | {args.duration}s |",
+        f"| Date | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} |",
+        "",
+    ]
+
+    # Prefill section
+    lines += [
+        "## Prefill Throughput",
+        "",
+        f"![Prefill]({prefill_plot})",
+        "",
+        "| Concurrency | Input Tokens | Seq Len | Prefill tok/s |",
+        "|-------------|-------------|---------|---------------|",
+    ]
+    for r in sorted(prefill_results, key=lambda x: x["concurrency"]):
+        lines.append(
+            f"| {r['concurrency']:,} | {r['input_len']:,} | {r['input_len']+r['output_len']:,} | {r['total_throughput']:,.0f} |"
+        )
+
+    # Decode sections
+    ratios = sorted(set(r["ratio"] for r in decode_results))
+    lines += [
+        "",
+        "## Decode Throughput",
+        "",
+        f"![Decode]({decode_plot})",
+        "",
+    ]
+    for ratio in ratios:
+        pct_in = int(ratio * 100)
+        pct_out = 100 - pct_in
+        lines += [
+            f"### {pct_in}% input / {pct_out}% output",
+            "",
+            "| Concurrency | Input | Output | Seq Len | Out tok/s | Total tok/s |",
+            "|-------------|-------|--------|---------|-----------|-------------|",
+        ]
+        subset = sorted([r for r in decode_results if r["ratio"] == ratio], key=lambda x: x["concurrency"])
+        for r in subset:
+            lines.append(
+                f"| {r['concurrency']:,} | {r['input_len']:,} | {r['output_len']:,} "
+                f"| {r['input_len']+r['output_len']:,} | {r['output_throughput']:,.0f} | {r['total_throughput']:,.0f} |"
+            )
+        lines.append("")
+
+    path.write_text("\n".join(lines))
+
+
+async def async_main(args):
+    ratios = [float(r) for r in args.ratios.split(",")]
+    concurrency_levels = [int(c) for c in args.concurrency_levels.split(",")]
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_name = safe_model_name(args.model)
+
+    # 1. Prefill benchmark
+    print("\n" + "=" * 70)
+    print("  PREFILL BENCHMARK (output_len=1)")
+    print("=" * 70)
+    prefill_results = await run_sweep(
+        base_url=args.base_url,
+        model=args.model,
+        kv_cache_tokens=args.kv_cache_tokens,
+        max_model_len=args.max_model_len,
+        concurrency_levels=concurrency_levels,
+        warmup=args.warmup,
+        duration=args.duration,
+        output_len_override=1,
+    )
+
+    # 2. Decode benchmark
+    print("\n" + "=" * 70)
+    print("  DECODE BENCHMARK")
+    print("=" * 70)
+    decode_results = await run_sweep(
+        base_url=args.base_url,
+        model=args.model,
+        kv_cache_tokens=args.kv_cache_tokens,
+        max_model_len=args.max_model_len,
+        concurrency_levels=concurrency_levels,
+        warmup=args.warmup,
+        duration=args.duration,
+        ratios=ratios,
+    )
+
+    if not prefill_results and not decode_results:
         print("No successful benchmark runs.")
         return
 
-    print_summary(results)
-    plot_results(results, output_dir, fixed_output_len=args.fixed_output_len)
+    # 3. Plots
+    prefill_plot = f"prefill_{model_name}.png"
+    decode_plot = f"decode_{model_name}.png"
 
-    with open(output_dir / "sweep_results.json", "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"Results saved to {output_dir / 'sweep_results.json'}")
+    if prefill_results:
+        plot_prefill(prefill_results, output_dir / prefill_plot, args.model)
+        print(f"\nPrefill plot saved to {output_dir / prefill_plot}")
+
+    if decode_results:
+        plot_decode(decode_results, output_dir / decode_plot, args.model)
+        print(f"Decode plot saved to {output_dir / decode_plot}")
+
+    # 4. Markdown report
+    md_path = output_dir / f"benchmark_{model_name}.md"
+    write_markdown(md_path, args, prefill_results, decode_results, prefill_plot, decode_plot)
+    print(f"Report saved to {md_path}")
+
+    # 5. Raw JSON
+    json_path = output_dir / f"benchmark_{model_name}.json"
+    with open(json_path, "w") as f:
+        json.dump({"prefill": prefill_results, "decode": decode_results}, f, indent=2)
+    print(f"Raw data saved to {json_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="vLLM throughput benchmark sweep (time-based)")
+    parser = argparse.ArgumentParser(description="vLLM throughput benchmark: prefill + decode sweep")
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--model", required=True)
     parser.add_argument("--kv-cache-tokens", type=int, required=True)
-    parser.add_argument("--ratios", default="0.25,0.5", help="Comma-separated input fractions of seq length")
-    parser.add_argument("--fixed-output-len", type=int, default=None, help="Override output_len to a fixed value (ignores ratios)")
+    parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size (for report metadata)")
+    parser.add_argument("--kv-cache-dtype", default="auto", help="KV cache dtype (for report metadata)")
+    parser.add_argument("--ratios", default="0.25,0.5", help="Comma-separated input fractions for decode")
     parser.add_argument("--concurrency-levels", default="32,64,128,256,512,1024,2048")
-    parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--max-model-len", type=int, default=65536)
     parser.add_argument("--warmup", type=float, default=10.0, help="Warmup seconds before measuring")
     parser.add_argument("--duration", type=float, default=15.0, help="Measurement duration in seconds")
     parser.add_argument("--output-dir", default="./bench-results")
