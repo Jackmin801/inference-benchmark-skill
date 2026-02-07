@@ -91,7 +91,7 @@ async def run_bench(
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         tasks = [asyncio.create_task(worker(session)) for _ in range(concurrency)]
 
-        print(f"  Warming up ({warmup_s}s)...", end="", flush=True)
+        print(f"  Warming up ({warmup_s:.0f}s)...", end="", flush=True)
         await asyncio.sleep(warmup_s)
         print(f" measuring ({measure_s}s)...", end="", flush=True)
 
@@ -123,8 +123,31 @@ async def run_bench(
     }
 
 
-async def run_sweep(base_url, model, kv_cache_tokens, max_model_len, concurrency_levels, warmup, duration, output_len_override=None, ratios=None):
-    """Run a sweep and return list of result dicts."""
+def estimate_warmup(concurrency: int, input_len: int, prefill_results: list[dict], margin: float = 1.5, min_s: float = 5.0, max_s: float = 120.0) -> float:
+    """Estimate warmup time from prefill results so all slots finish prefill before measurement."""
+    # Find prefill tps at matching or nearest concurrency
+    by_conc = {r["concurrency"]: r["total_throughput"] for r in prefill_results}
+    if concurrency in by_conc:
+        prefill_tps = by_conc[concurrency]
+    else:
+        # Use nearest concurrency
+        nearest = min(by_conc.keys(), key=lambda c: abs(c - concurrency))
+        prefill_tps = by_conc[nearest]
+
+    if prefill_tps <= 0:
+        return max_s
+
+    total_prefill_tokens = concurrency * input_len
+    warmup = (total_prefill_tokens / prefill_tps) * margin
+    return max(min_s, min(warmup, max_s))
+
+
+async def run_sweep(base_url, model, kv_cache_tokens, max_model_len, concurrency_levels, warmup, duration, output_len_override=None, ratios=None, prefill_results=None, warmup_margin=1.5):
+    """Run a sweep and return list of result dicts.
+
+    If prefill_results is provided, warmup is computed automatically per config
+    based on how long prefill takes to fill all concurrency slots.
+    """
     if output_len_override is not None:
         sweep_ratios = [None]
     else:
@@ -150,6 +173,11 @@ async def run_sweep(base_url, model, kv_cache_tokens, max_model_len, concurrency
                 print(f"\nSkipping concurrency={concurrency}: seq too small")
                 continue
 
+            if prefill_results:
+                effective_warmup = estimate_warmup(concurrency, input_len, prefill_results, margin=warmup_margin)
+            else:
+                effective_warmup = warmup
+
             print(f"\n{'='*60}")
             print(f"  concurrency={concurrency}  input={input_len}  output={output_len}  seq={input_len+output_len}")
             print(f"{'='*60}")
@@ -168,7 +196,7 @@ async def run_sweep(base_url, model, kv_cache_tokens, max_model_len, concurrency
                 actual_input_tokens=actual_input,
                 output_len=output_len,
                 concurrency=concurrency,
-                warmup_s=warmup,
+                warmup_s=effective_warmup,
                 measure_s=duration,
             )
 
@@ -320,6 +348,8 @@ async def async_main(args):
     # 2. Decode benchmark
     print("\n" + "=" * 70)
     print("  DECODE BENCHMARK")
+    if args.auto_warmup and prefill_results:
+        print("  (auto-warmup from prefill results)")
     print("=" * 70)
     decode_results = await run_sweep(
         base_url=args.base_url,
@@ -330,6 +360,8 @@ async def async_main(args):
         warmup=args.warmup,
         duration=args.duration,
         ratios=ratios,
+        prefill_results=prefill_results if args.auto_warmup else None,
+        warmup_margin=args.warmup_margin,
     )
 
     if not prefill_results and not decode_results:
@@ -370,8 +402,10 @@ def main():
     parser.add_argument("--ratios", default="0.25,0.5", help="Comma-separated input fractions for decode")
     parser.add_argument("--concurrency-levels", default="32,64,128,256,512,1024,2048")
     parser.add_argument("--max-model-len", type=int, default=65536)
-    parser.add_argument("--warmup", type=float, default=10.0, help="Warmup seconds before measuring")
+    parser.add_argument("--warmup", type=float, default=10.0, help="Warmup seconds (used for prefill; decode default if auto-warmup is off)")
     parser.add_argument("--duration", type=float, default=15.0, help="Measurement duration in seconds")
+    parser.add_argument("--auto-warmup", action="store_true", help="Auto-compute decode warmup from prefill results")
+    parser.add_argument("--warmup-margin", type=float, default=1.5, help="Margin multiplier for auto-warmup (default 1.5)")
     parser.add_argument("--output-dir", default="./bench-results")
     args = parser.parse_args()
 
