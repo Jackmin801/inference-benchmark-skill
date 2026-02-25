@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,53 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Diverse token list for generating prompts with good expert distribution in MoE models.
+# Mixes English, Chinese, Korean, Arabic, numbers, and emoji — each entry likely
+# tokenizes to 1 token in most modern tokenizers.
+_WORD_LIST = [
+    # English
+    "the", "be", "to", "of", "and", "a", "in", "that", "have", "it",
+    "for", "not", "on", "with", "as", "you", "do", "at", "this", "but",
+    "from", "they", "we", "say", "her", "she", "or", "an", "will", "my",
+    "one", "all", "would", "there", "what", "so", "up", "out", "if", "about",
+    "who", "get", "which", "go", "when", "make", "can", "like", "time", "no",
+    "just", "know", "take", "people", "into", "year", "good", "some", "them", "see",
+    "than", "now", "look", "only", "come", "over", "think", "also", "back", "after",
+    "use", "how", "our", "work", "first", "well", "way", "even", "new", "want",
+    # Chinese (common single characters — each is 1 token)
+    "\u4e00", "\u4e8c", "\u4e09", "\u56db", "\u4e94", "\u516d", "\u4e03", "\u516b", "\u4e5d", "\u5341",
+    "\u5927", "\u5c0f", "\u591a", "\u5c11", "\u4e0a", "\u4e0b", "\u5de6", "\u53f3", "\u524d", "\u540e",
+    "\u4eba", "\u5929", "\u5730", "\u65e5", "\u6708", "\u5e74", "\u6c34", "\u706b", "\u5c71", "\u6728",
+    "\u91d1", "\u571f", "\u98ce", "\u4e91", "\u96e8", "\u96ea", "\u82b1", "\u8349", "\u9e1f", "\u9c7c",
+    "\u9a6c", "\u725b", "\u7f8a", "\u732b", "\u72d7", "\u9f99", "\u864e", "\u5154", "\u86c7", "\u9f20",
+    "\u7ea2", "\u84dd", "\u7eff", "\u767d", "\u9ed1", "\u9ec4", "\u7d2b", "\u6a59", "\u7c89", "\u7070",
+    "\u7231", "\u5fc3", "\u624b", "\u773c", "\u53e3", "\u8033", "\u5934", "\u8eab", "\u8db3", "\u58f0",
+    "\u660e", "\u6697", "\u51b7", "\u70ed", "\u65b0", "\u65e7", "\u5feb", "\u6162", "\u771f", "\u5047",
+    # Korean (common syllables — each is 1 token)
+    "\ub098", "\ub108", "\uc6b0", "\ub9ac", "\uadf8", "\uc774", "\uc800", "\uc5ec", "\ub0a8", "\uc544",
+    "\ud558", "\ub298", "\uc0ac", "\ub78c", "\ub9d0", "\ub9cc", "\ub4e4", "\ub9ce", "\ub610", "\uac00",
+    "\uc624", "\ub0a0", "\ub9c8", "\uc74c", "\ubcf4", "\uc54c", "\uc218", "\uc5b4", "\uc6d4", "\ubb3c",
+    "\uc0b0", "\uaf43", "\ub098", "\ubb34", "\ud48d", "\ube44", "\ub208", "\ubd88", "\ub545", "\ud558",
+    # Arabic (common words — each typically 1 token)
+    "\u0641\u064a", "\u0645\u0646", "\u0639\u0644\u0649", "\u0647\u0630\u0627", "\u0623\u0646",
+    "\u0645\u0639", "\u0644\u0627", "\u0643\u0644", "\u0648", "\u0623\u0648",
+    "\u0628\u0639\u062f", "\u0642\u0628\u0644", "\u0628\u064a\u0646", "\u062b\u0645", "\u0623\u064a",
+    "\u0643\u0627\u0646", "\u0639\u0646", "\u0625\u0644\u0649", "\u0644\u0645", "\u0642\u062f",
+    # Numbers (single/double digits and common numbers)
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "10", "42", "100", "256", "512", "1024", "2048", "99", "77", "33",
+    # Emoji (common single-codepoint emoji — each is 1 token)
+    "\U0001f600", "\U0001f60a", "\U0001f60d", "\U0001f622", "\U0001f44d",
+    "\U0001f44e", "\U0001f525", "\U0001f4a1", "\U0001f680", "\u2764",
+    "\U0001f308", "\U0001f31f", "\U0001f3b5", "\U0001f4d6", "\U0001f4bb",
+    "\u2705", "\u274c", "\u26a1", "\U0001f30d", "\U0001f340",
+]
+
+
+def _random_words(n: int, seed: int = 42) -> list[str]:
+    rng = random.Random(seed)
+    return [rng.choice(_WORD_LIST) for _ in range(n)]
+
 
 def safe_model_name(model: str) -> str:
     return model.split("/")[-1]
@@ -18,7 +66,7 @@ def safe_model_name(model: str) -> str:
 
 async def make_prompt(base_url: str, model: str, target_tokens: int) -> tuple[str, int]:
     """Generate a prompt calibrated to approximately target_tokens input tokens."""
-    words = ["hi"] * target_tokens
+    words = _random_words(target_tokens)
     prompt = " ".join(words)
     url = f"{base_url}/v1/chat/completions"
 
@@ -30,7 +78,7 @@ async def make_prompt(base_url: str, model: str, target_tokens: int) -> tuple[st
 
         if abs(actual - target_tokens) / target_tokens > 0.05:
             adjusted = int(len(words) * target_tokens / actual)
-            words = ["hi"] * max(1, adjusted)
+            words = _random_words(max(1, adjusted))
             prompt = " ".join(words)
             payload["messages"] = [{"role": "user", "content": prompt}]
             async with session.post(url, json=payload) as resp:
